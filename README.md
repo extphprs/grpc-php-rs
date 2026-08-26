@@ -108,10 +108,10 @@ google-ads-php, Temporal, OpenTelemetry, etcd — run as test suites
 
 # Charts from production 
 
-<img width="1600" height="608" alt="image" src="https://github.com/user-attachments/assets/1985577f-9288-4711-9386-089d5b75e6ad" />
-<img width="1600" height="608" alt="image" src="https://github.com/user-attachments/assets/d8c18c81-729f-4e3b-b162-ffa56471a5e3" />
-<img width="1600" height="672" alt="image" src="https://github.com/user-attachments/assets/81e2264c-c58d-4f1a-bcc5-fb7d0da3b710" />
-<img width="1600" height="672" alt="image" src="https://github.com/user-attachments/assets/a49a90d4-7432-485e-971d-1e2993702414" />
+<img width="1600" height="608" alt="image" src="https://github.com/user-attachments/assets/68795ba9-c635-4733-9370-04480861d7f9" />
+<img width="1600" height="608" alt="image" src="https://github.com/user-attachments/assets/8d70c249-4420-4a2b-8796-098d506a007b" />
+<img width="1600" height="672" alt="image" src="https://github.com/user-attachments/assets/78258cd9-3a66-414e-a5eb-03264083ade7" />
+<img width="1600" height="672" alt="image" src="https://github.com/user-attachments/assets/32fd6153-9a5d-44c8-975f-7a0197df8707" />
 
 
 ## Building from Source
