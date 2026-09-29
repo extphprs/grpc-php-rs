@@ -15,7 +15,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ghcr.io/bsn4/grpc-php-rs
+  IMAGE: ghcr.io/extphprs/grpc-php-rs
 
 jobs:
   build-image:
@@ -84,6 +84,8 @@ jobs:
           push: true
           build-args: |
             PHP_IMAGE=${{ steps.meta.outputs.php_image }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/extphprs/grpc-php-rs
           tags: |
             ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-php${{ matrix.php }}${{ steps.meta.outputs.tag_suffix }}
             ${{ env.IMAGE }}:latest-php${{ matrix.php }}${{ steps.meta.outputs.tag_suffix }}
