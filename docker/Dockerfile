@@ -1,7 +1,7 @@
 # Pre-built grpc-php-rs extension image.
 #
 # Usage in your Dockerfile:
-#   COPY --from=ghcr.io/bsn4/grpc-php-rs:latest-php8.5 /usr/local/ /usr/local/
+#   COPY --from=ghcr.io/extphprs/grpc-php-rs:latest-php8.5 /usr/local/ /usr/local/
 #
 # Build args:
 #   PHP_IMAGE  - base PHP image to compile against (e.g. php:8.5-cli, php:8.5-zts)

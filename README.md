@@ -1,6 +1,6 @@
 # grpc-php-rs
 
-[![CI](https://github.com/BSN4/grpc-php-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/BSN4/grpc-php-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/extphprs/grpc-php-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/extphprs/grpc-php-rs/actions/workflows/ci.yml)
 [![PIE](https://img.shields.io/badge/PIE-bsn4%2Fgrpc-blue)](https://packagist.org/packages/bsn4/grpc)
 [![PHP](https://img.shields.io/badge/PHP-8.2%2B-8892BF)](https://www.php.net)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -28,20 +28,20 @@ One line in your Dockerfile — no build tools needed:
 ```dockerfile
 FROM php:8.5-cli
 
-COPY --from=ghcr.io/bsn4/grpc-php-rs:latest-php8.5 /usr/local/ /usr/local/
+COPY --from=ghcr.io/extphprs/grpc-php-rs:latest-php8.5 /usr/local/ /usr/local/
 ```
 
 For ZTS (FrankenPHP, Swoole, etc.):
 
 ```dockerfile
-COPY --from=ghcr.io/bsn4/grpc-php-rs:latest-php8.5-zts /usr/local/ /usr/local/
+COPY --from=ghcr.io/extphprs/grpc-php-rs:latest-php8.5-zts /usr/local/ /usr/local/
 ```
 
 For Alpine:
 
 ```dockerfile
 FROM php:8.5-alpine
-COPY --from=ghcr.io/bsn4/grpc-php-rs:latest-php8.5-alpine /usr/local/ /usr/local/
+COPY --from=ghcr.io/extphprs/grpc-php-rs:latest-php8.5-alpine /usr/local/ /usr/local/
 ```
 
 Available tags: `latest-php{8.2,8.3,8.4,8.5}` for Debian, append `-alpine` for Alpine, append `-zts` for thread-safe (e.g. `latest-php8.5-alpine-zts`). Version-pinned tags like `v0.2.1-php8.5-alpine` are also available.
@@ -56,7 +56,7 @@ Requires [PIE 1.4.0+](https://github.com/php/pie/releases/tag/1.4.0) for pre-pac
 
 ### Manual download
 
-Download the appropriate `.so` from the [latest release](https://github.com/BSN4/grpc-php-rs/releases/latest), then:
+Download the appropriate `.so` from the [latest release](https://github.com/extphprs/grpc-php-rs/releases/latest), then:
 
 ```sh
 # Copy to your PHP extensions directory

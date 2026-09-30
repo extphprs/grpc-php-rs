@@ -1,7 +1,7 @@
 # Pre-built grpc-php-rs extension image (Alpine / musl).
 #
 # Usage in your Dockerfile:
-#   COPY --from=ghcr.io/bsn4/grpc-php-rs:latest-php8.5-alpine /usr/local/ /usr/local/
+#   COPY --from=ghcr.io/extphprs/grpc-php-rs:latest-php8.5-alpine /usr/local/ /usr/local/
 #
 # Build args:
 #   PHP_IMAGE  - base PHP Alpine image (e.g. php:8.5-alpine, php:8.5-zts-alpine)
