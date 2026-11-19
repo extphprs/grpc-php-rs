@@ -4,6 +4,7 @@ use bytes::Bytes;
 use ext_php_rs::boxed::ZBox;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ArrayKey, ZendCallable, ZendHashTable, ZendObject, Zval};
+use ext_php_rs::zend::ExecutorGlobals;
 use http::uri::PathAndQuery;
 use parking_lot::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -191,17 +192,19 @@ fn invoke_call_plugin(
         .try_call(vec![&service_url.to_string()])
         .map_err(|e| {
             let msg = match &e {
-                ext_php_rs::error::Error::Exception(obj) => {
-                    let class = obj
-                        .get_class_name()
-                        .unwrap_or_else(|_| "Exception".to_string());
-                    // `$message` is protected — call the public getter instead.
-                    let message = obj
-                        .try_call_method("getMessage", vec![])
-                        .ok()
-                        .and_then(|zv| zv.string())
-                        .unwrap_or_default();
-                    format!("plugin threw {class}: {message}")
+                ext_php_rs::error::Error::ExceptionPending { class } => {
+                    match ExecutorGlobals::take_exception() {
+                        Some(obj) => {
+                            // `$message` is protected — call the public getter instead.
+                            let message = obj
+                                .try_call_method("getMessage", vec![])
+                                .ok()
+                                .and_then(|zv| zv.string())
+                                .unwrap_or_default();
+                            format!("plugin threw {class}: {message}")
+                        }
+                        None => format!("plugin threw {class}"),
+                    }
                 }
                 other => format!("{other}"),
             };
@@ -560,7 +563,7 @@ impl GrpcCall {
             if done {
                 result_obj.set_property(prop, true).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set {prop}: {e}"))
+                        PhpException::from_message(format!("set {prop}: {e}"))
                     },
                 )?;
             }
@@ -961,13 +964,13 @@ impl GrpcCall {
                 result_obj
                     .set_property("metadata", metadata_to_php(md).map_err(PhpException::from)?)
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             } else {
                 result_obj
                     .set_property("metadata", ZendHashTable::new())
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             }
         }
@@ -980,7 +983,7 @@ impl GrpcCall {
                 // message, measurable on MB-scale payloads).
                 result_obj.set_property("message", bytes_to_php_string_zval(&bytes)).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set message: {e}"))
+                        PhpException::from_message(format!("set message: {e}"))
                     },
                 )?;
             } else {
@@ -988,7 +991,7 @@ impl GrpcCall {
                 null_zval.set_null();
                 result_obj.set_property("message", null_zval).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set message: {e}"))
+                        PhpException::from_message(format!("set message: {e}"))
                     },
                 )?;
             }
@@ -1001,28 +1004,28 @@ impl GrpcCall {
                 status_obj
                     .set_property("metadata", metadata_to_php(md).map_err(PhpException::from)?)
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set status metadata: {e}"))
+                        PhpException::from_message(format!("set status metadata: {e}"))
                     })?;
             } else {
                 status_obj
                     .set_property("metadata", ZendHashTable::new())
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set status metadata: {e}"))
+                        PhpException::from_message(format!("set status metadata: {e}"))
                     })?;
             }
             status_obj
                 .set_property("code", status_code as i64)
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status code: {e}"))
+                    PhpException::from_message(format!("set status code: {e}"))
                 })?;
             status_obj.set_property("details", status_message).map_err(
                 |e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status details: {e}"))
+                    PhpException::from_message(format!("set status details: {e}"))
                 },
             )?;
 
             result_obj.set_property("status", status_obj).map_err(
-                |e: ext_php_rs::error::Error| PhpException::default(format!("set status: {e}")),
+                |e: ext_php_rs::error::Error| PhpException::from_message(format!("set status: {e}")),
             )?;
         }
 
@@ -1489,15 +1492,15 @@ impl GrpcCall {
         let state = self
             .stream_state
             .as_ref()
-            .ok_or_else(|| PhpException::default("no active stream".into()))?;
+            .ok_or_else(|| PhpException::from_message("no active stream".into()))?;
 
         let tx = state
             .msg_tx
             .as_ref()
-            .ok_or_else(|| PhpException::default("stream does not support sending".into()))?;
+            .ok_or_else(|| PhpException::from_message("stream does not support sending".into()))?;
 
         rt.block_on(async { tx.send(message).await })
-            .map_err(|_| PhpException::default("stream send channel closed".into()))?;
+            .map_err(|_| PhpException::from_message("stream send channel closed".into()))?;
 
         Ok(())
     }
@@ -1516,7 +1519,7 @@ impl GrpcCall {
         let state = self
             .stream_state
             .as_mut()
-            .ok_or_else(|| PhpException::default("no active stream".into()))?;
+            .ok_or_else(|| PhpException::from_message("no active stream".into()))?;
 
         let mut result_obj = ZendObject::new_stdclass();
 
@@ -1532,13 +1535,13 @@ impl GrpcCall {
                 result_obj
                     .set_property("metadata", metadata_to_php(md).map_err(PhpException::from)?)
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             } else {
                 result_obj
                     .set_property("metadata", ZendHashTable::new())
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             }
         }
@@ -1551,7 +1554,7 @@ impl GrpcCall {
                 null_zval.set_null();
                 result_obj.set_property("message", null_zval).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set message: {e}"))
+                        PhpException::from_message(format!("set message: {e}"))
                     },
                 )?;
             } else {
@@ -1570,7 +1573,7 @@ impl GrpcCall {
                         // Single copy into PHP memory (see build_unary_result).
                         result_obj.set_property("message", bytes_to_php_string_zval(&bytes)).map_err(
                             |e: ext_php_rs::error::Error| {
-                                PhpException::default(format!("set message: {e}"))
+                                PhpException::from_message(format!("set message: {e}"))
                             },
                         )?;
                     }
@@ -1580,7 +1583,7 @@ impl GrpcCall {
                         null_zval.set_null();
                         result_obj.set_property("message", null_zval).map_err(
                             |e: ext_php_rs::error::Error| {
-                                PhpException::default(format!("set message: {e}"))
+                                PhpException::from_message(format!("set message: {e}"))
                             },
                         )?;
                     }
@@ -1596,7 +1599,7 @@ impl GrpcCall {
                         null_zval.set_null();
                         result_obj.set_property("message", null_zval).map_err(
                             |e: ext_php_rs::error::Error| {
-                                PhpException::default(format!("set message: {e}"))
+                                PhpException::from_message(format!("set message: {e}"))
                             },
                         )?;
                     }
@@ -1655,21 +1658,21 @@ impl GrpcCall {
                     metadata_to_php(&trailers.metadata).map_err(PhpException::from)?,
                 )
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status metadata: {e}"))
+                    PhpException::from_message(format!("set status metadata: {e}"))
                 })?;
             status_obj
                 .set_property("code", trailers.code as i64)
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status code: {e}"))
+                    PhpException::from_message(format!("set status code: {e}"))
                 })?;
             status_obj
                 .set_property("details", trailers.message)
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status details: {e}"))
+                    PhpException::from_message(format!("set status details: {e}"))
                 })?;
 
             result_obj.set_property("status", status_obj).map_err(
-                |e: ext_php_rs::error::Error| PhpException::default(format!("set status: {e}")),
+                |e: ext_php_rs::error::Error| PhpException::from_message(format!("set status: {e}")),
             )?;
         }
 
