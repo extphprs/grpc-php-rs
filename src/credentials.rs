@@ -159,7 +159,7 @@ impl GrpcCallCredentials {
     #[php(name = "createFromPlugin")]
     pub fn create_from_plugin(callback: &Zval) -> PhpResult<Self> {
         if !callback.is_callable() {
-            return Err(PhpException::default(
+            return Err(PhpException::from_message(
                 "createFromPlugin expects a callable".into(),
             ));
         }

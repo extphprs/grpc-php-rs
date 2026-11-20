@@ -54,9 +54,9 @@ impl GrpcTimeval {
     pub fn now() -> PhpResult<Self> {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         let usec = i64::try_from(duration.as_micros())
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         Ok(Self {
             usec,
             is_span: false,
@@ -132,9 +132,9 @@ impl GrpcTimeval {
     pub fn sleep_until(&self) -> PhpResult<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         let now_usec = i64::try_from(now.as_micros())
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         let remaining = self.usec.saturating_sub(now_usec);
         if remaining > 0 && self.usec != i64::MAX {
             let rt = crate::runtime::get_runtime().map_err(PhpException::from)?;
