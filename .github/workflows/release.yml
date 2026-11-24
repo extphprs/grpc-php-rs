@@ -93,7 +93,7 @@ jobs:
                 echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ bookworm main" > /etc/apt/sources.list.d/php.list
                 apt-get update && apt-get install -y --no-install-recommends php8.6-cli php8.6-dev
               fi
-              php -r "exit(PHP_ZTS === (getenv(\"EXPECTED_TS\") === \"zts\" ? 1 : 0) ? 0 : 1);"
+              php -r "exit((bool) PHP_ZTS === (getenv(\"EXPECTED_TS\") === \"zts\") ? 0 : 1);"
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
               . "$HOME/.cargo/env"
               cargo build --release
@@ -115,7 +115,7 @@ jobs:
                 apk add --no-cache -X https://dl-cdn.alpinelinux.org/alpine/edge/testing php86 php86-dev
                 export PHP=/usr/bin/php86 PHP_CONFIG=/usr/bin/php-config86
               fi
-              "${PHP:-php}" -r "exit(PHP_ZTS === (getenv(\"EXPECTED_TS\") === \"zts\" ? 1 : 0) ? 0 : 1);"
+              "${PHP:-php}" -r "exit((bool) PHP_ZTS === (getenv(\"EXPECTED_TS\") === \"zts\") ? 0 : 1);"
               apk add --no-cache curl gcc g++ make pkgconfig protobuf protobuf-dev clang-dev musl-dev linux-headers
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
               . "$HOME/.cargo/env"
