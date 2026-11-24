@@ -4,6 +4,7 @@ use bytes::Bytes;
 use ext_php_rs::boxed::ZBox;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ArrayKey, ZendCallable, ZendHashTable, ZendObject, Zval};
+use ext_php_rs::zend::ExecutorGlobals;
 use http::uri::PathAndQuery;
 use parking_lot::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -143,7 +144,41 @@ fn deadline_exceeded_trailers() -> StreamTrailers {
 /// such calls locally as DEADLINE_EXCEEDED without ever sending the request;
 /// racing a minimal timeout against a fast response is not equivalent.
 fn deadline_already_expired(deadline_usec: i64) -> bool {
-    deadline_usec > 0 && deadline_usec < i64::MAX && deadline_usec <= now_usec()
+    deadline_usec < i64::MAX && deadline_usec <= now_usec()
+}
+
+/// The deadline C-core would actually enforce for `deadline_usec`. C-core
+/// keeps deadlines in whole milliseconds, rounded up, and its timer fires on
+/// the tick after the deadline — so a deadline that is "now", or a few
+/// microseconds away, still lets a fast call through (measured against
+/// ext-grpc 1.85: `new Timeval(1)` and `Timeval::now()` as deadlines succeed
+/// on loopback, a deadline a second in the past fails).
+fn core_deadline(deadline_usec: i64) -> i64 {
+    if deadline_usec == i64::MAX || deadline_usec == i64::MIN {
+        return deadline_usec;
+    }
+    let whole_ms = deadline_usec.div_euclid(1000) + i64::from(deadline_usec.rem_euclid(1000) != 0);
+    whole_ms.saturating_add(1).saturating_mul(1000)
+}
+
+/// True when the server refused this call's HTTP/2 stream without processing
+/// it: the stream is above the last-stream-id of a graceful GOAWAY, or was
+/// reset with REFUSED_STREAM. HTTP/2 guarantees such a request never reached
+/// the application, so repeating it is safe for any method (gRFC A6,
+/// "transparent retry"). A GOAWAY carrying an error code fails every stream
+/// on the connection, processed or not, and does not qualify.
+fn refused_unprocessed(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(err) = source {
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+            let reason = h2_err.reason();
+            return h2_err.is_remote()
+                && ((h2_err.is_go_away() && reason == Some(h2::Reason::NO_ERROR))
+                    || (h2_err.is_reset() && reason == Some(h2::Reason::REFUSED_STREAM)));
+        }
+        source = err.source();
+    }
+    false
 }
 
 fn status_to_php(status: &tonic::Status, deadline_usec: i64) -> (i32, String) {
@@ -152,6 +187,12 @@ fn status_to_php(status: &tonic::Status, deadline_usec: i64) -> (i32, String) {
 
     if code == tonic::Code::Cancelled as i32 && deadline_set && now_usec() >= deadline_usec {
         return (4, "Deadline Exceeded".to_string());
+    }
+
+    // tonic maps a graceful GOAWAY to INTERNAL; C-core reports a call the
+    // server refused to start as UNAVAILABLE, which retry policies key on.
+    if refused_unprocessed(status) {
+        return (14, status.message().to_string());
     }
 
     // tonic reports a transport-level failure it cannot classify (e.g. the
@@ -181,27 +222,23 @@ fn invoke_call_plugin(
     let callable = ZendCallable::new(zval)
         .map_err(|_| GrpcError::CallbackFailed("stored value is not callable".into()))?;
 
-    // IMPORTANT: never Debug- or Display-format `ext_php_rs::error::Error` here.
-    // The `Exception` variant formats the thrown PHP object graph, which is
-    // cyclic (exception traces reference objects that reference the exception)
-    // and ext-php-rs's derived Debug has no cycle detection — formatting it
-    // recurses until the stack overflows (SIGSEGV). Extract the class name and
-    // message properties ourselves instead.
+    // Never Debug-format the taken ZendObject (cyclic exception traces overflow the stack).
     let result = callable
         .try_call(vec![&service_url.to_string()])
         .map_err(|e| {
             let msg = match &e {
-                ext_php_rs::error::Error::Exception(obj) => {
-                    let class = obj
-                        .get_class_name()
-                        .unwrap_or_else(|_| "Exception".to_string());
-                    // `$message` is protected — call the public getter instead.
-                    let message = obj
-                        .try_call_method("getMessage", vec![])
-                        .ok()
-                        .and_then(|zv| zv.string())
-                        .unwrap_or_default();
-                    format!("plugin threw {class}: {message}")
+                ext_php_rs::error::Error::ExceptionPending { class } => {
+                    match ExecutorGlobals::take_exception() {
+                        Some(obj) => {
+                            let message = obj
+                                .try_call_method("getMessage", vec![])
+                                .ok()
+                                .and_then(|zv| zv.string())
+                                .unwrap_or_default();
+                            format!("plugin threw {class}: {message}")
+                        }
+                        None => format!("plugin threw {class}"),
+                    }
                 }
                 other => format!("{other}"),
             };
@@ -448,18 +485,29 @@ pub struct GrpcCall {
 
 #[php_impl]
 impl GrpcCall {
-    /// Constructs a new Call.
     pub fn __construct(
-        channel: &GrpcChannel,
-        method: String,
-        deadline: &GrpcTimeval,
-        host_override: Option<String>,
+        channel: &Zval,
+        method: &Zval,
+        deadline: &Zval,
+        host_override: Option<&Zval>,
     ) -> PhpResult<Self> {
+        let msg = "Call expects a Channel, a String, a Timeval and an optional String";
+        let channel = channel
+            .extract::<&GrpcChannel>()
+            .ok_or_else(|| crate::error::invalid_argument(msg))?;
+        let method =
+            crate::args::string(method).ok_or_else(|| crate::error::invalid_argument(msg))?;
+        let deadline = deadline
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument(msg))?;
+        let host_override = host_override
+            .map(|zv| crate::args::string(zv).ok_or_else(|| crate::error::invalid_argument(msg)))
+            .transpose()?;
         let tonic_channel = channel.get_tonic_channel().ok_or_else(|| {
             crate::error::invalid_argument("Call cannot be constructed from a closed Channel")
         })?;
 
-        let target = channel.get_target_uri().unwrap_or_default();
+        let target = channel.get_authority().unwrap_or_default();
 
         let call_plugin = channel.get_call_plugin();
         let max_decoding_message_size = channel.get_max_decoding_message_size();
@@ -469,7 +517,7 @@ impl GrpcCall {
             channel: tonic_channel,
             method,
             target,
-            deadline_usec: deadline.to_absolute_usec(),
+            deadline_usec: core_deadline(deadline.to_absolute_usec()),
             host_override,
             call_plugin,
             max_decoding_message_size,
@@ -495,19 +543,15 @@ impl GrpcCall {
     /// For streaming, a background tokio task drives the tonic stream and
     /// communicates with PHP via channels. State persists across startBatch calls.
     #[php(name = "startBatch")]
-    pub fn start_batch(&mut self, ops: &ZendHashTable) -> PhpResult<ZBox<ZendObject>> {
+    pub fn start_batch(&mut self, ops: &Zval) -> PhpResult<ZBox<ZendObject>> {
+        let ops = ops
+            .array()
+            .ok_or_else(|| crate::error::invalid_argument("start_batch expects an array"))?;
         if self.channel_closed.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(crate::error::runtime_exception(
                 "startBatch Error. Channel is closed",
             ));
         }
-        if self.cancel_token.is_cancelled() {
-            return Err(PhpException::from(GrpcError::Status {
-                code: 1, // CANCELLED
-                message: "Call has been cancelled".into(),
-            }));
-        }
-
         let batch = self.parse_ops(ops)?;
 
         // A batch with no recognized ops does nothing (C-core returns OK
@@ -545,7 +589,13 @@ impl GrpcCall {
         let sent_close = batch.send_close;
         let recv_status = batch.recv_status;
 
-        let mut result_obj = self.dispatch_batch(batch)?;
+        // After Call::cancel() ext-grpc keeps accepting batches: send ops are
+        // acknowledged and dropped, receive ops report CANCELLED.
+        let mut result_obj = if self.cancel_token.is_cancelled() {
+            self.build_cancelled_result(&batch)?
+        } else {
+            self.dispatch_batch(batch)?
+        };
 
         if recv_status {
             self.finished = true;
@@ -560,7 +610,7 @@ impl GrpcCall {
             if done {
                 result_obj.set_property(prop, true).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set {prop}: {e}"))
+                        PhpException::from_message(format!("set {prop}: {e}"))
                     },
                 )?;
             }
@@ -597,9 +647,12 @@ impl GrpcCall {
 
     /// Sets call credentials.
     #[php(name = "setCredentials")]
-    pub fn set_credentials(&mut self, creds: &GrpcCallCredentials) -> i64 {
+    pub fn set_credentials(&mut self, creds: &Zval) -> PhpResult<i64> {
+        let creds = creds.extract::<&GrpcCallCredentials>().ok_or_else(|| {
+            crate::error::invalid_argument("setCredentials expects 1 CallCredentials")
+        })?;
         self.call_plugin = Some(Arc::clone(&creds.plugin));
-        0 // CALL_OK
+        Ok(0) // CALL_OK
     }
 }
 
@@ -773,35 +826,7 @@ impl GrpcCall {
             let path = PathAndQuery::try_from(method.as_str())
                 .map_err(|e| GrpcError::InvalidArg(format!("invalid method path: {e}")))?;
 
-            // Build the request
             let message = send_message.unwrap_or_default();
-            let mut request = tonic::Request::new(message);
-
-            // Apply metadata
-            let req_metadata = request.metadata_mut();
-            for (key, value) in &send_metadata {
-                if let Ok(name) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes())
-                    && let Ok(val) = value.parse()
-                {
-                    req_metadata.insert(name, val);
-                }
-            }
-            for (key, value) in &plugin_metadata {
-                if let Ok(name) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes())
-                    && let Ok(val) = value.parse()
-                {
-                    req_metadata.insert(name, val);
-                }
-            }
-
-            // Apply deadline/timeout
-            if deadline_usec < i64::MAX && deadline_usec > 0 {
-                // A deadline already in the past still sets a minimal timeout
-                // so the call reports DEADLINE_EXCEEDED (via status_to_php)
-                // like ext-grpc, instead of running without one.
-                let timeout_usec = deadline_usec.saturating_sub(now_usec()).max(1);
-                request.set_timeout(std::time::Duration::from_micros(timeout_usec as u64));
-            }
 
             // Make the unary call using the raw codec, with cancellation support
             let mut grpc_client = tonic::client::Grpc::new(channel);
@@ -820,37 +845,49 @@ impl GrpcCall {
                 "Deadline Exceeded".to_string(),
             );
 
-            // The deadline also bounds connection establishment.
-            match tokio::time::timeout_at(deadline, grpc_client.ready()).await {
-                Ok(ready) => ready.map_err(GrpcError::Transport)?,
-                Err(_elapsed) => return Ok(deadline_exceeded),
-            }
+            let mut retried = false;
+            loop {
+                // The deadline also bounds connection establishment.
+                match tokio::time::timeout_at(deadline, grpc_client.ready()).await {
+                    Ok(ready) => ready.map_err(GrpcError::Transport)?,
+                    Err(_elapsed) => return Ok(deadline_exceeded),
+                }
 
-            let call_future = grpc_client.unary(request, path, RawBytesCodec);
+                let request = Self::build_request(
+                    &send_metadata,
+                    &plugin_metadata,
+                    message.clone(),
+                    deadline_usec,
+                );
+                let call_future = grpc_client.unary(request, path.clone(), RawBytesCodec);
 
-            // Race the gRPC call against the cancellation token and the deadline
-            tokio::select! {
-                () = tokio::time::sleep_until(deadline) => Ok(deadline_exceeded),
-                response = call_future => {
-                    match response {
-                        Ok(resp) => {
-                            let (resp_metadata, body, _extensions) = resp.into_parts();
-                            // Return the body even when empty — the C-based grpc extension
-                            // returns "" for 0-byte messages, and PHP libraries depend on that.
-                            Ok((Some(resp_metadata), Some(body), None, 0i32, String::new()))
-                        }
-                        Err(status) => {
-                            let (code, msg) = status_to_php(&status, deadline_usec);
-                            let md = status_metadata_for_php(&status);
-                            Ok((None, None, Some(md), code, msg))
+                // Race the gRPC call against the cancellation token and the deadline
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => return Ok(deadline_exceeded),
+                    response = call_future => {
+                        match response {
+                            Ok(resp) => {
+                                let (resp_metadata, body, _extensions) = resp.into_parts();
+                                // Return the body even when empty — the C-based grpc extension
+                                // returns "" for 0-byte messages, and PHP libraries depend on that.
+                                return Ok((Some(resp_metadata), Some(body), None, 0i32, String::new()));
+                            }
+                            Err(status) if !retried && refused_unprocessed(&status) => {
+                                retried = true;
+                            }
+                            Err(status) => {
+                                let (code, msg) = status_to_php(&status, deadline_usec);
+                                let md = status_metadata_for_php(&status);
+                                return Ok((None, None, Some(md), code, msg));
+                            }
                         }
                     }
-                }
-                () = cancel_token.cancelled() => {
-                    Err(GrpcError::Status {
-                        code: 1,
-                        message: "Call cancelled".into(),
-                    })
+                    () = cancel_token.cancelled() => {
+                        return Err(GrpcError::Status {
+                            code: 1,
+                            message: "Call cancelled".into(),
+                        });
+                    }
                 }
             }
         });
@@ -961,13 +998,13 @@ impl GrpcCall {
                 result_obj
                     .set_property("metadata", metadata_to_php(md).map_err(PhpException::from)?)
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             } else {
                 result_obj
                     .set_property("metadata", ZendHashTable::new())
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             }
         }
@@ -980,7 +1017,7 @@ impl GrpcCall {
                 // message, measurable on MB-scale payloads).
                 result_obj.set_property("message", bytes_to_php_string_zval(&bytes)).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set message: {e}"))
+                        PhpException::from_message(format!("set message: {e}"))
                     },
                 )?;
             } else {
@@ -988,7 +1025,7 @@ impl GrpcCall {
                 null_zval.set_null();
                 result_obj.set_property("message", null_zval).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set message: {e}"))
+                        PhpException::from_message(format!("set message: {e}"))
                     },
                 )?;
             }
@@ -1001,31 +1038,78 @@ impl GrpcCall {
                 status_obj
                     .set_property("metadata", metadata_to_php(md).map_err(PhpException::from)?)
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set status metadata: {e}"))
+                        PhpException::from_message(format!("set status metadata: {e}"))
                     })?;
             } else {
                 status_obj
                     .set_property("metadata", ZendHashTable::new())
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set status metadata: {e}"))
+                        PhpException::from_message(format!("set status metadata: {e}"))
                     })?;
             }
             status_obj
                 .set_property("code", status_code as i64)
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status code: {e}"))
+                    PhpException::from_message(format!("set status code: {e}"))
                 })?;
             status_obj.set_property("details", status_message).map_err(
                 |e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status details: {e}"))
+                    PhpException::from_message(format!("set status details: {e}"))
                 },
             )?;
 
             result_obj.set_property("status", status_obj).map_err(
-                |e: ext_php_rs::error::Error| PhpException::default(format!("set status: {e}")),
+                |e: ext_php_rs::error::Error| PhpException::from_message(format!("set status: {e}")),
             )?;
         }
 
+        Ok(result_obj)
+    }
+
+    /// The result of a batch on a cancelled call: empty initial metadata, no
+    /// message, status CANCELLED — whichever of those the batch asked for.
+    fn build_cancelled_result(&self, batch: &BatchOps) -> PhpResult<ZBox<ZendObject>> {
+        let set_err = |what: &'static str| {
+            move |e: ext_php_rs::error::Error| PhpException::from_message(format!("set {what}: {e}"))
+        };
+        let mut result_obj = ZendObject::new_stdclass();
+        if batch.recv_initial_metadata {
+            result_obj
+                .set_property("metadata", ZendHashTable::new())
+                .map_err(set_err("metadata"))?;
+        }
+        if batch.recv_message {
+            let mut null_zval = Zval::new();
+            null_zval.set_null();
+            result_obj
+                .set_property("message", null_zval)
+                .map_err(set_err("message"))?;
+        }
+        if batch.recv_status {
+            // C-core words the status differently once the response has begun.
+            let response_started = self
+                .stream_state
+                .as_ref()
+                .is_some_and(|stream| stream.meta_rx.is_none());
+            let details = if response_started {
+                "Stream removed (CANCELLED)"
+            } else {
+                "CANCELLED"
+            };
+            let mut status_obj = ZendObject::new_stdclass();
+            status_obj
+                .set_property("metadata", ZendHashTable::new())
+                .map_err(set_err("status metadata"))?;
+            status_obj
+                .set_property("code", 1i64)
+                .map_err(set_err("status code"))?;
+            status_obj
+                .set_property("details", details)
+                .map_err(set_err("status details"))?;
+            result_obj
+                .set_property("status", status_obj)
+                .map_err(set_err("status"))?;
+        }
         Ok(result_obj)
     }
 
@@ -1118,12 +1202,7 @@ impl GrpcCall {
             PhpException::from(GrpcError::InvalidArg(format!("invalid method path: {e}")))
         })?;
 
-        let request = Self::build_request(
-            &send_metadata,
-            &plugin_metadata,
-            send_message.unwrap_or_default(),
-            deadline_usec,
-        );
+        let message = send_message.unwrap_or_default();
 
         // Channels: messages (bounded, see STREAM_MSG_BUFFER), initial metadata, trailers
         let (msg_tx, msg_rx) =
@@ -1144,35 +1223,49 @@ impl GrpcCall {
             let deadline_sleep = tokio::time::sleep_until(deadline);
             tokio::pin!(deadline_sleep);
 
-            // The deadline bounds connection establishment too (see deadline_instant).
-            match tokio::time::timeout_at(deadline, grpc_client.ready()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let status = tonic::Status::from_error(Box::new(e));
-                    let _ = meta_tx.send(tonic::metadata::MetadataMap::default());
-                    let _ = msg_tx.send(Err(status)).await;
-                    return;
+            let mut retried = false;
+            let response = loop {
+                // The deadline bounds connection establishment too (see deadline_instant).
+                match tokio::time::timeout_at(deadline, grpc_client.ready()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let status = tonic::Status::from_error(Box::new(e));
+                        let _ = meta_tx.send(tonic::metadata::MetadataMap::default());
+                        let _ = msg_tx.send(Err(status)).await;
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        let _ = meta_tx.send(tonic::metadata::MetadataMap::default());
+                        let _ = msg_tx.send(Ok(None)).await;
+                        let _ = trailers_tx.send(deadline_exceeded_trailers());
+                        return;
+                    }
                 }
-                Err(_elapsed) => {
-                    let _ = meta_tx.send(tonic::metadata::MetadataMap::default());
-                    let _ = msg_tx.send(Ok(None)).await;
-                    let _ = trailers_tx.send(deadline_exceeded_trailers());
-                    return;
-                }
-            }
 
-            let response = match tokio::time::timeout_at(
-                deadline,
-                grpc_client.server_streaming(request, path, RawBytesCodec),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_elapsed) => {
-                    let _ = meta_tx.send(tonic::metadata::MetadataMap::default());
-                    let _ = msg_tx.send(Ok(None)).await;
-                    let _ = trailers_tx.send(deadline_exceeded_trailers());
-                    return;
+                let request = Self::build_request(
+                    &send_metadata,
+                    &plugin_metadata,
+                    message.clone(),
+                    deadline_usec,
+                );
+                match tokio::time::timeout_at(
+                    deadline,
+                    grpc_client.server_streaming(request, path.clone(), RawBytesCodec),
+                )
+                .await
+                {
+                    // No response headers arrived, so nothing was delivered
+                    // to PHP yet and the call can start over.
+                    Ok(Err(status)) if !retried && refused_unprocessed(&status) => {
+                        retried = true;
+                    }
+                    Ok(r) => break r,
+                    Err(_elapsed) => {
+                        let _ = meta_tx.send(tonic::metadata::MetadataMap::default());
+                        let _ = msg_tx.send(Ok(None)).await;
+                        let _ = trailers_tx.send(deadline_exceeded_trailers());
+                        return;
+                    }
                 }
             };
 
@@ -1489,15 +1582,15 @@ impl GrpcCall {
         let state = self
             .stream_state
             .as_ref()
-            .ok_or_else(|| PhpException::default("no active stream".into()))?;
+            .ok_or_else(|| PhpException::from_message("no active stream".into()))?;
 
         let tx = state
             .msg_tx
             .as_ref()
-            .ok_or_else(|| PhpException::default("stream does not support sending".into()))?;
+            .ok_or_else(|| PhpException::from_message("stream does not support sending".into()))?;
 
         rt.block_on(async { tx.send(message).await })
-            .map_err(|_| PhpException::default("stream send channel closed".into()))?;
+            .map_err(|_| PhpException::from_message("stream send channel closed".into()))?;
 
         Ok(())
     }
@@ -1516,7 +1609,7 @@ impl GrpcCall {
         let state = self
             .stream_state
             .as_mut()
-            .ok_or_else(|| PhpException::default("no active stream".into()))?;
+            .ok_or_else(|| PhpException::from_message("no active stream".into()))?;
 
         let mut result_obj = ZendObject::new_stdclass();
 
@@ -1532,13 +1625,13 @@ impl GrpcCall {
                 result_obj
                     .set_property("metadata", metadata_to_php(md).map_err(PhpException::from)?)
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             } else {
                 result_obj
                     .set_property("metadata", ZendHashTable::new())
                     .map_err(|e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set metadata: {e}"))
+                        PhpException::from_message(format!("set metadata: {e}"))
                     })?;
             }
         }
@@ -1551,7 +1644,7 @@ impl GrpcCall {
                 null_zval.set_null();
                 result_obj.set_property("message", null_zval).map_err(
                     |e: ext_php_rs::error::Error| {
-                        PhpException::default(format!("set message: {e}"))
+                        PhpException::from_message(format!("set message: {e}"))
                     },
                 )?;
             } else {
@@ -1570,7 +1663,7 @@ impl GrpcCall {
                         // Single copy into PHP memory (see build_unary_result).
                         result_obj.set_property("message", bytes_to_php_string_zval(&bytes)).map_err(
                             |e: ext_php_rs::error::Error| {
-                                PhpException::default(format!("set message: {e}"))
+                                PhpException::from_message(format!("set message: {e}"))
                             },
                         )?;
                     }
@@ -1580,7 +1673,7 @@ impl GrpcCall {
                         null_zval.set_null();
                         result_obj.set_property("message", null_zval).map_err(
                             |e: ext_php_rs::error::Error| {
-                                PhpException::default(format!("set message: {e}"))
+                                PhpException::from_message(format!("set message: {e}"))
                             },
                         )?;
                     }
@@ -1596,7 +1689,7 @@ impl GrpcCall {
                         null_zval.set_null();
                         result_obj.set_property("message", null_zval).map_err(
                             |e: ext_php_rs::error::Error| {
-                                PhpException::default(format!("set message: {e}"))
+                                PhpException::from_message(format!("set message: {e}"))
                             },
                         )?;
                     }
@@ -1655,21 +1748,21 @@ impl GrpcCall {
                     metadata_to_php(&trailers.metadata).map_err(PhpException::from)?,
                 )
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status metadata: {e}"))
+                    PhpException::from_message(format!("set status metadata: {e}"))
                 })?;
             status_obj
                 .set_property("code", trailers.code as i64)
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status code: {e}"))
+                    PhpException::from_message(format!("set status code: {e}"))
                 })?;
             status_obj
                 .set_property("details", trailers.message)
                 .map_err(|e: ext_php_rs::error::Error| {
-                    PhpException::default(format!("set status details: {e}"))
+                    PhpException::from_message(format!("set status details: {e}"))
                 })?;
 
             result_obj.set_property("status", status_obj).map_err(
-                |e: ext_php_rs::error::Error| PhpException::default(format!("set status: {e}")),
+                |e: ext_php_rs::error::Error| PhpException::from_message(format!("set status: {e}")),
             )?;
         }
 

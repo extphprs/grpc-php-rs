@@ -1,6 +1,6 @@
 [package]
 name = "grpc-php-rs"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [lib]
@@ -27,12 +27,13 @@ lto = true
 codegen-units = 1
 
 [dependencies]
-ext-php-rs = { version = "0.15", features = ["closure"] }
-tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "tls-webpki-roots"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-tokio-util = "0.7"
-tokio-stream = "0.1"
-parking_lot = "0.12"
-bytes = "1"
-http = "1"
-thiserror = "2"
+ext-php-rs = { version = "0.16.5", features = ["closure"] }
+tonic = { version = "0.14.9", default-features = false, features = ["transport", "tls-ring", "tls-webpki-roots"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = "0.7.20"
+tokio-stream = "0.1.19"
+parking_lot = "0.13"
+bytes = "1.12"
+http = "1.5"
+h2 = "0.4.20"
+thiserror = "2.0.21"

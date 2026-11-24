@@ -23,9 +23,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.2', '8.3', '8.4', '8.5']
+        php: ['8.2', '8.3', '8.4', '8.5', '8.6']
         ts: ['nts', 'zts']
         libc: ['glibc', 'musl']
+        exclude:
+          # Official php:8.6 images are ZTS-only (no separate -zts tags).
+          - php: '8.6'
+            ts: 'zts'
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +77,17 @@ jobs:
           fi
 
           echo "dockerfile=${DOCKERFILE}" >> "$GITHUB_OUTPUT"
-          echo "tag_suffix=${ALPINE_SUFFIX}${TS_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${VERSION}-php${{ matrix.php }}${ALPINE_SUFFIX}${TS_SUFFIX}"
+            echo "${IMAGE}:latest-php${{ matrix.php }}${ALPINE_SUFFIX}${TS_SUFFIX}"
+            if [[ "${{ matrix.php }}" == "8.6" ]]; then
+              echo "${IMAGE}:${VERSION}-php8.6${ALPINE_SUFFIX}-zts"
+              echo "${IMAGE}:latest-php8.6${ALPINE_SUFFIX}-zts"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -86,8 +100,6 @@ jobs:
             PHP_IMAGE=${{ steps.meta.outputs.php_image }}
           labels: |
             org.opencontainers.image.source=https://github.com/extphprs/grpc-php-rs
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-php${{ matrix.php }}${{ steps.meta.outputs.tag_suffix }}
-            ${{ env.IMAGE }}:latest-php${{ matrix.php }}${{ steps.meta.outputs.tag_suffix }}
+          tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha,scope=php${{ matrix.php }}-${{ matrix.ts }}-${{ matrix.libc }}
           cache-to: type=gha,mode=max,scope=php${{ matrix.php }}-${{ matrix.ts }}-${{ matrix.libc }}

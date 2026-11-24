@@ -32,6 +32,7 @@ Commands:
   streaming   Run server streaming test with local gRPC test server
   trailer     Run binary trailing metadata test with local gRPC test server
   unary       Run split-batch unary test with local gRPC test server
+  refused     Run refused-stream retry test (GOAWAY / REFUSED_STREAM server)
   deadline    Run deadline-covers-connect test (blackholed endpoint, ~30s)
   lifecycle   Run connection lifecycle test (idle, server restarts, outage)
   promises    Run gax-style promise concurrency test (grpc/grpc + guzzle)
@@ -56,6 +57,7 @@ build_target() {
     local tag="${IMAGE}:${target}"
     info "Building ${target}"
     DOCKER_BUILDKIT=1 docker build \
+        --build-arg "PHP_VERSION=${PHP_VERSION:-8.5}" \
         --target "$target" \
         -t "$tag" \
         -f "$DOCKERFILE" . \
@@ -123,6 +125,13 @@ cmd_unary() {
     info "Running split-batch unary test"
     run_target test-unary
     ok "Split-batch unary test passed"
+}
+
+cmd_refused() {
+    build_target test-refused
+    info "Running refused-stream retry test"
+    run_target test-refused
+    ok "Refused-stream retry test passed"
 }
 
 cmd_deadline() {
@@ -382,6 +391,8 @@ cmd_all() {
     echo ""
     cmd_unary
     echo ""
+    cmd_refused
+    echo ""
     cmd_deadline
     echo ""
     cmd_lifecycle
@@ -409,6 +420,7 @@ case "$command" in
     streaming)   cmd_streaming ;;
     trailer)     cmd_trailer ;;
     unary)       cmd_unary ;;
+    refused)     cmd_refused ;;
     deadline)    cmd_deadline ;;
     lifecycle)   cmd_lifecycle ;;
     promises)    cmd_promises ;;

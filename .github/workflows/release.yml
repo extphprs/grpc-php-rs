@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.2', '8.3', '8.4', '8.5']
+        php: ['8.2', '8.3', '8.4', '8.5', '8.6']
         arch: ['x86_64', 'arm64']
         ts: ['nts', 'zts']
         libc: ['glibc', 'musl']
@@ -50,7 +50,19 @@ jobs:
         id: docker
         run: |
           PHP_MINOR="${{ matrix.php }}"
-          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+          if [[ "${PHP_MINOR}" == "8.6" ]]; then
+            if [[ "${{ matrix.libc }}" == "musl" ]]; then
+              if [[ "${{ matrix.ts }}" == "zts" ]]; then
+                echo "image=php:8.6-alpine" >> "$GITHUB_OUTPUT"
+              else
+                echo "image=alpine:edge" >> "$GITHUB_OUTPUT"
+              fi
+            elif [[ "${{ matrix.ts }}" == "zts" ]]; then
+              echo "image=php:8.6-cli" >> "$GITHUB_OUTPUT"
+            else
+              echo "image=debian:bookworm" >> "$GITHUB_OUTPUT"
+            fi
+          elif [[ "${{ matrix.libc }}" == "musl" ]]; then
             if [[ "${{ matrix.ts }}" == "zts" ]]; then
               echo "image=php:${PHP_MINOR}-zts-alpine" >> "$GITHUB_OUTPUT"
             else
@@ -68,12 +80,20 @@ jobs:
         if: matrix.libc == 'glibc'
         run: |
           docker run --rm \
+            -e EXPECTED_TS="${{ matrix.ts }}" \
+            -e PHP_MINOR="${{ matrix.php }}" \
             -v "${{ github.workspace }}:/src" \
             -w /src \
             ${{ steps.docker.outputs.image }} \
             sh -c '
               set -e
-              apt-get update && apt-get install -y curl gcc make libclang-dev
+              apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gcc make libclang-dev
+              if [ "$PHP_MINOR" = "8.6" ] && [ "$EXPECTED_TS" = "nts" ]; then
+                curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg
+                echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ bookworm main" > /etc/apt/sources.list.d/php.list
+                apt-get update && apt-get install -y --no-install-recommends php8.6-cli php8.6-dev
+              fi
+              php -r "exit(PHP_ZTS === (getenv(\"EXPECTED_TS\") === \"zts\" ? 1 : 0) ? 0 : 1);"
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
               . "$HOME/.cargo/env"
               cargo build --release
@@ -84,11 +104,18 @@ jobs:
         if: matrix.libc == 'musl'
         run: |
           docker run --rm \
+            -e EXPECTED_TS="${{ matrix.ts }}" \
+            -e PHP_MINOR="${{ matrix.php }}" \
             -v "${{ github.workspace }}:/src" \
             -w /src \
             ${{ steps.docker.outputs.image }} \
             sh -c '
               set -e
+              if [ "$PHP_MINOR" = "8.6" ] && [ "$EXPECTED_TS" = "nts" ]; then
+                apk add --no-cache -X https://dl-cdn.alpinelinux.org/alpine/edge/testing php86 php86-dev
+                export PHP=/usr/bin/php86 PHP_CONFIG=/usr/bin/php-config86
+              fi
+              "${PHP:-php}" -r "exit(PHP_ZTS === (getenv(\"EXPECTED_TS\") === \"zts\" ? 1 : 0) ? 0 : 1);"
               apk add --no-cache curl gcc g++ make pkgconfig protobuf protobuf-dev clang-dev musl-dev linux-headers
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
               . "$HOME/.cargo/env"
@@ -119,7 +146,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.2', '8.3', '8.4', '8.5']
+        php: ['8.2', '8.3', '8.4', '8.5', '8.6']
     steps:
       - uses: actions/checkout@v6
 
@@ -153,7 +180,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.2', '8.3', '8.4', '8.5']
+        php: ['8.2', '8.3', '8.4', '8.5', '8.6']
     steps:
       - uses: actions/checkout@v6
 

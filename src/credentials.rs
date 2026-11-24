@@ -36,15 +36,22 @@ pub(crate) fn next_credentials_id() -> u64 {
 
 #[php_impl]
 impl GrpcChannelCredentials {
-    /// Creates SSL credentials.
-    ///
-    /// PHP signature: createSsl(?string $pem_root_certs, ?string $pem_key, ?string $pem_cert): ChannelCredentials
     #[php(name = "createSsl")]
     pub fn create_ssl(
-        pem_root_certs: Option<String>,
-        pem_private_key: Option<String>,
-        pem_cert_chain: Option<String>,
+        pem_root_certs: Option<&Zval>,
+        pem_private_key: Option<&Zval>,
+        pem_cert_chain: Option<&Zval>,
     ) -> PhpResult<Self> {
+        let msg = "createSsl expects 3 optional strings";
+        let parse = |arg: Option<&Zval>| match arg {
+            None => Ok(None),
+            Some(zv) => crate::args::nullable_string(zv)
+                .ok_or_else(|| crate::error::invalid_argument(msg)),
+        };
+        let pem_root_certs = parse(pem_root_certs)?;
+        let pem_private_key = parse(pem_private_key)?;
+        let pem_cert_chain = parse(pem_cert_chain)?;
+
         // Always enable webpki-roots (Mozilla CA bundle) as fallback.
         // tonic does NOT auto-enable it even with the `tls-webpki-roots` feature.
         let mut tls = ClientTlsConfig::new().with_webpki_roots();
@@ -80,12 +87,15 @@ impl GrpcChannelCredentials {
         None
     }
 
-    /// Creates composite channel credentials (TLS + call credentials).
     #[php(name = "createComposite")]
-    pub fn create_composite(
-        channel_creds: &GrpcChannelCredentials,
-        call_creds: &GrpcCallCredentials,
-    ) -> PhpResult<Self> {
+    pub fn create_composite(channel_creds: &Zval, call_creds: &Zval) -> PhpResult<Self> {
+        let channel_creds = channel_creds
+            .extract::<&GrpcChannelCredentials>()
+            .ok_or_else(|| crate::error::invalid_argument("createComposite expects 2 Credentials"))?;
+        let call_creds = call_creds
+            .extract::<&GrpcCallCredentials>()
+            .ok_or_else(|| crate::error::invalid_argument("createComposite expects 2 Credentials"))?;
+
         let tls_config = match &channel_creds.inner {
             CredentialsInner::Ssl { tls_config } => tls_config.clone(),
             CredentialsInner::Composite { tls_config, .. } => tls_config.clone(),
@@ -118,11 +128,14 @@ impl GrpcChannelCredentials {
         }
     }
 
-    /// Sets the default root PEM certificates.
     #[php(name = "setDefaultRootsPem")]
-    pub fn set_default_roots_pem(pem: String) {
+    pub fn set_default_roots_pem(pem: &Zval) -> PhpResult<()> {
+        let pem = crate::args::string(pem).ok_or_else(|| {
+            crate::error::invalid_argument("setDefaultRootsPem expects 1 string")
+        })?;
         let mut guard = DEFAULT_ROOTS_PEM.lock();
         *guard = Some(pem);
+        Ok(())
     }
 
     /// Checks if default root PEM has been set.
@@ -152,15 +165,11 @@ pub struct GrpcCallCredentials {
 
 #[php_impl]
 impl GrpcCallCredentials {
-    /// Creates call credentials from a PHP callable plugin.
-    ///
-    /// The callable signature: function(string $service_url): array
-    /// Returns ['key' => 'value', ...] metadata entries.
     #[php(name = "createFromPlugin")]
     pub fn create_from_plugin(callback: &Zval) -> PhpResult<Self> {
         if !callback.is_callable() {
-            return Err(PhpException::default(
-                "createFromPlugin expects a callable".into(),
+            return Err(crate::error::invalid_argument(
+                "createFromPlugin expects 1 callback",
             ));
         }
 
@@ -172,20 +181,20 @@ impl GrpcCallCredentials {
         })
     }
 
-    /// Creates composite call credentials (chains two call credentials).
     #[php(name = "createComposite")]
-    pub fn create_composite(
-        creds1: &GrpcCallCredentials,
-        creds2: &GrpcCallCredentials,
-    ) -> PhpResult<Self> {
-        // For composite, we store the first plugin only.
-        // A full implementation would chain them, but for Phase 1 we use the first.
+    pub fn create_composite(creds1: &Zval, creds2: &Zval) -> PhpResult<Self> {
+        let creds1 = creds1.extract::<&GrpcCallCredentials>().ok_or_else(|| {
+            crate::error::invalid_argument("createComposite expects 2 CallCredentials")
+        })?;
+        let creds2 = creds2.extract::<&GrpcCallCredentials>().ok_or_else(|| {
+            crate::error::invalid_argument("createComposite expects 2 CallCredentials")
+        })?;
+
         let plugin = {
             let guard = creds1.plugin.lock();
             guard.as_ref().map(|z| z.shallow_clone())
         };
 
-        // If creds1 has no plugin, try creds2
         let plugin = plugin.or_else(|| {
             let guard = creds2.plugin.lock();
             guard.as_ref().map(|z| z.shallow_clone())

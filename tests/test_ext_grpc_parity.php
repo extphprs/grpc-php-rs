@@ -484,7 +484,7 @@ ledger('send-metadata-raw-bytes-not-corrupted', false, 'status=13', 'x-f3raw:686
     return implode(' | ', $k) ?: '(none)';
 });
 
-ledger('infpast-deadline-fails-immediately', false, 'code=4', 'code=0', function () {
+ledger('infpast-deadline-fails-immediately', true, 'code=4', 'code=0', function () {
     $call = new Grpc\Call(chan(), ECHO_M, Grpc\Timeval::infPast());
     $r = $call->startBatch(fullBatch());
     return 'code=' . $r->status->code;
@@ -539,9 +539,151 @@ ledger('string-batch-key-invalid-argument', false, 'InvalidArgumentException(1)'
 // non-strict file: strict_types here would apply to the closures' call sites
 // and measure the wrong mode entirely.
 require __DIR__ . '/parity_weak_probes.php';
-ledger('weak-mode-coercion', false, 'int=ok null=ok str=ok',
+ledger('weak-mode-coercion', true, 'int=ok null=ok str=ok',
     'int=throw:InvalidArgumentException null=throw:InvalidArgumentException str=throw:InvalidArgumentException',
     fn() => weak_mode_probes(chan()));
+
+ledger('wrong-type-args-invalid-argument', true, 'all-InvalidArgumentException', 'TypeError', function () {
+    $ch = chan();
+    $tv = new Grpc\Timeval(1000);
+    $call = new Grpc\Call($ch, ECHO_M, $tv);
+    $ssl = Grpc\ChannelCredentials::createSsl();
+    $cc = Grpc\CallCredentials::createFromPlugin(fn($u) => []);
+    $bad = [
+        fn() => new Grpc\Channel(42, 42),
+        fn() => $ch->watchConnectivityState('x', $tv),
+        fn() => new Grpc\Call(42, ECHO_M, $tv),
+        fn() => $call->startBatch('x'),
+        fn() => $call->setCredentials(null),
+        fn() => Grpc\ChannelCredentials::createSsl([]),
+        fn() => Grpc\ChannelCredentials::createComposite(42, $cc),
+        fn() => Grpc\ChannelCredentials::createComposite($ssl, 42),
+        fn() => Grpc\ChannelCredentials::setDefaultRootsPem([]),
+        fn() => Grpc\CallCredentials::createFromPlugin(42),
+        fn() => Grpc\CallCredentials::createComposite(42, $cc),
+        fn() => $tv->add('x'),
+        fn() => $tv->subtract('x'),
+        fn() => Grpc\Timeval::compare('x', $tv),
+        fn() => Grpc\Timeval::similar('x', $tv, $tv),
+    ];
+    foreach ($bad as $i => $fn) {
+        $got = obs($fn);
+        if ($got !== 'InvalidArgumentException') return "case{$i}={$got}";
+    }
+    return 'all-InvalidArgumentException';
+});
+
+// This file declares strict_types, and ext-grpc's zend_parse_parameters honors
+// it: scalars are not coerced here (they are in weak mode — see
+// weak_scalar_probes in parity_weak_probes.php).
+ledger('strict-mode-scalars-rejected', true, 'all-InvalidArgumentException', 'ok', function () {
+    $ch = chan();
+    $tv = new Grpc\Timeval(1000);
+    $bad = [
+        fn() => Grpc\ChannelCredentials::createSsl(42),
+        fn() => Grpc\ChannelCredentials::setDefaultRootsPem(42),
+        fn() => new Grpc\Channel(42, []),
+        fn() => new Grpc\Call($ch, 42, $tv),
+        fn() => new Grpc\Call($ch, ECHO_M, $tv, 42),
+        fn() => $ch->watchConnectivityState('1', $tv),
+        fn() => $ch->getConnectivityState(1),
+        fn() => new Grpc\Timeval('1000'),
+    ];
+    foreach ($bad as $i => $fn) {
+        $got = obs($fn);
+        if ($got !== 'InvalidArgumentException') return "case{$i}={$got}";
+    }
+    return 'all-InvalidArgumentException';
+});
+
+ledger('weak-mode-scalars-coerced', true, 'all-ok', 'case1=InvalidArgumentException',
+    fn() => weak_scalar_probes(chan()));
+
+ledger('argument-error-messages', true, 'all-match', 'case1', function () {
+    $ch = chan();
+    $tv = new Grpc\Timeval(1000);
+    $call = new Grpc\Call($ch, ECHO_M, $tv);
+    $cc = Grpc\CallCredentials::createFromPlugin(fn($u) => []);
+    $expect = [
+        'Channel expects a string and an array' => fn() => new Grpc\Channel([], []),
+        'getConnectivityState expects a bool' => fn() => $ch->getConnectivityState([]),
+        'watchConnectivityState expects 1 long 1 timeval' => fn() => $ch->watchConnectivityState([], $tv),
+        'Call expects a Channel, a String, a Timeval and an optional String' => fn() => new Grpc\Call(42, ECHO_M, $tv),
+        'start_batch expects an array' => fn() => $call->startBatch('x'),
+        'setCredentials expects 1 CallCredentials' => fn() => $call->setCredentials(null),
+        'createSsl expects 3 optional strings' => fn() => Grpc\ChannelCredentials::createSsl([]),
+        'createComposite expects 2 Credentials' => fn() => Grpc\ChannelCredentials::createComposite(42, $cc),
+        'setDefaultRootsPem expects 1 string' => fn() => Grpc\ChannelCredentials::setDefaultRootsPem([]),
+        'createFromPlugin expects 1 callback' => fn() => Grpc\CallCredentials::createFromPlugin(42),
+        'createComposite expects 2 CallCredentials' => fn() => Grpc\CallCredentials::createComposite(42, $cc),
+        'Timeval expects a long or double' => fn() => new Grpc\Timeval([]),
+        'add expects a Timeval' => fn() => $tv->add('x'),
+        'subtract expects a Timeval' => fn() => $tv->subtract('x'),
+        'compare expects two Timevals' => fn() => Grpc\Timeval::compare('x', $tv),
+        // ext-grpc's similar() really does call itself "compare".
+        'compare expects three Timevals' => fn() => Grpc\Timeval::similar('x', $tv, $tv),
+    ];
+    foreach ($expect as $message => $fn) {
+        try { $fn(); return "no exception for \"{$message}\""; }
+        catch (InvalidArgumentException $e) {
+            if ($e->getMessage() !== $message || $e->getCode() !== 1) {
+                return "expected \"{$message}\", got \"{$e->getMessage()}\" code {$e->getCode()}";
+            }
+        }
+    }
+    return 'all-match';
+});
+
+// Issue #20: gRPC name syntax (https://github.com/grpc/grpc/blob/master/doc/naming.md).
+ledger('name-syntax-targets', true, 'dns:///=0 dns:=0 ipv4:=0', 'Exception: invalid URI', function () {
+    global $TARGET;
+    [$host, $port] = explode(':', $TARGET);
+    $ip = gethostbyname($host);
+    $out = [];
+    foreach (["dns:///{$TARGET}" => 'dns:///', "dns:{$TARGET}" => 'dns:', "ipv4:{$ip}:{$port}" => 'ipv4:'] as $target => $label) {
+        $ch = new Grpc\Channel($target, ['credentials' => Grpc\ChannelCredentials::createInsecure()]);
+        if ($ch->getTarget() !== $target) return "getTarget()={$ch->getTarget()}";
+        $call = new Grpc\Call($ch, ECHO_M, dl3());
+        $out[] = $label . '=' . $call->startBatch(fullBatch())->status->code;
+    }
+    return implode(' ', $out);
+});
+
+// After cancel() ext-grpc keeps accepting batches: sends are acknowledged,
+// receives report CANCELLED. (Observed against ext-grpc 1.85.4.)
+ledger('cancel-reports-cancelled-status', true,
+    'unary=1:CANCELLED:NULL send=ok stream=1:NULL',
+    'Exception: gRPC status 1: Call has been cancelled', function () {
+    $call = new Grpc\Call(chan(), ECHO_M, dl3());
+    $call->cancel();
+    $r = $call->startBatch(fullBatch());
+    $unary = "{$r->status->code}:{$r->status->details}:" . var_export($r->message, true);
+    if ($r->send_message !== true || $r->metadata !== []) return 'unary result shape';
+
+    $call = new Grpc\Call(chan(), ECHO_M, dl3());
+    $call->cancel();
+    $send = $call->startBatch([Grpc\OP_SEND_INITIAL_METADATA => []])->send_metadata === true ? 'ok' : 'no-ack';
+
+    $call = new Grpc\Call(chan(), '/grpc.testing.TestService/StreamEcho', dl3());
+    $call->startBatch([Grpc\OP_SEND_INITIAL_METADATA => [], Grpc\OP_SEND_MESSAGE => ['message' => ep('repeat:1000')],
+        Grpc\OP_SEND_CLOSE_FROM_CLIENT => true, Grpc\OP_RECV_INITIAL_METADATA => true]);
+    $call->startBatch([Grpc\OP_RECV_MESSAGE => true]);
+    $call->cancel();
+    $m = $call->startBatch([Grpc\OP_RECV_MESSAGE => true]);
+    $st = $call->startBatch([Grpc\OP_RECV_STATUS_ON_CLIENT => true]);
+    return "unary={$unary} send={$send} stream={$st->status->code}:" . var_export($m->message, true);
+});
+
+// C-core keeps deadlines in whole milliseconds and fires them a tick late, so
+// a deadline of "now" still lets a loopback call through, while one clearly in
+// the past fails without the call being made.
+ledger('deadline-millisecond-resolution', true, 'now=0 span1us=0 past=4', 'now=4 span1us=4 past=4', function () {
+    $code = fn(Grpc\Timeval $d) => (new Grpc\Call(chan(), ECHO_M, $d))->startBatch(fullBatch())->status->code;
+    $ch = chan();
+    (new Grpc\Call($ch, ECHO_M, dl3()))->startBatch(fullBatch()); // connect first
+    return sprintf('now=%d span1us=%d past=%d', $code(Grpc\Timeval::now()), $code(new Grpc\Timeval(1)),
+        $code(Grpc\Timeval::now()->subtract(new Grpc\Timeval(1_000_000))));
+});
 
 // ═══════════════════════════════ Runner ════════════════════════════════════
 

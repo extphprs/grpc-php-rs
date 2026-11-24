@@ -1,5 +1,7 @@
+ARG PHP_VERSION=8.5
+
 # Stage 1: Build the Rust extension for NTS Linux
-FROM php:8.5-cli AS builder
+FROM php:${PHP_VERSION}-cli AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl build-essential pkg-config protobuf-compiler libclang-dev \
@@ -23,7 +25,7 @@ RUN cargo build --release \
 
 # ---------------------------------------------------------------------------
 # Stage 2: Build the Rust extension for ZTS Linux
-FROM dunglas/frankenphp:1-php8.5 AS builder-zts
+FROM dunglas/frankenphp:1-php${PHP_VERSION} AS builder-zts
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl build-essential pkg-config protobuf-compiler libclang-dev \
@@ -43,7 +45,7 @@ RUN cargo build --release
 
 # ---------------------------------------------------------------------------
 # Stage 3: Base NTS test image (extension installed, no Composer deps)
-FROM php:8.5-cli AS test-base
+FROM php:${PHP_VERSION}-cli AS test-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends git unzip \
     && rm -rf /var/lib/apt/lists/*
@@ -92,7 +94,7 @@ CMD ["php", "tests/test_grpc_gcp_compat.php"]
 
 # ---------------------------------------------------------------------------
 # Stage 7: ZTS (thread-safe) PHP via FrankenPHP
-FROM dunglas/frankenphp:1-php8.5 AS test-zts
+FROM dunglas/frankenphp:1-php${PHP_VERSION} AS test-zts
 
 RUN EXT_DIR="$(php -i | grep '^extension_dir' | head -1 | sed 's/.*=> //' | awk '{print $1}')" \
     && mkdir -p "$EXT_DIR" \
@@ -151,6 +153,16 @@ COPY --from=test-server-builder /build/target/release/grpc-test-server /usr/loca
 COPY tests/test_unary_split.php /app/tests/test_unary_split.php
 
 CMD ["sh", "-c", "grpc-test-server & sleep 1 && php tests/test_unary_split.php"]
+
+# ---------------------------------------------------------------------------
+# Stage 9bb2: Refused-stream test (issue #22) — a raw HTTP/2 server that
+# refuses calls with GOAWAY / RST_STREAM(REFUSED_STREAM); see refusing_server.py.
+FROM test-base AS test-refused
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-h2 \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["sh", "-c", "python3 tests/refusing_server.py & sleep 1 && php tests/test_refused_stream.php"]
 
 # ---------------------------------------------------------------------------
 # Stage 9bc: gax-style promise concurrency test (issue #18) — drives the real
@@ -213,16 +225,16 @@ CMD ["sh", "-c", "grpc-test-server 2>/dev/null & sleep 1 && php tests/parity_pro
 
 # ---------------------------------------------------------------------------
 # Stage 9e: Parity probe under official ext-grpc (pecl)
-FROM php:8.5-cli AS test-parity-extgrpc
+FROM php:${PHP_VERSION}-cli AS test-parity-extgrpc
 
 RUN apt-get update && apt-get install -y --no-install-recommends $PHPIZE_DEPS zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && pecl install grpc \
+    && MAKEFLAGS="-j$(( $(nproc) < 4 ? $(nproc) : 4 ))" pecl install grpc \
     && docker-php-ext-enable grpc
 
 COPY --from=test-server-builder /build/target/release/grpc-test-server /usr/local/bin/grpc-test-server
 WORKDIR /app
-COPY tests/parity_probe.php /app/tests/parity_probe.php
+COPY tests/parity_probe.php tests/parity_arg_cases.inc /app/tests/
 COPY tests/bench.php /app/tests/bench.php
 
 CMD ["sh", "-c", "grpc-test-server 2>/dev/null & sleep 1 && php tests/parity_probe.php"]

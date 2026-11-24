@@ -215,9 +215,12 @@ $result['bidi_streaming'] = scenario('bidi_streaming', function () use ($channel
     $call = new Grpc\Call($channel, '/grpc.testing.TestService/BidiEcho', Grpc\Timeval::infFuture());
     $call->startBatch([Grpc\OP_SEND_INITIAL_METADATA => []]);
     $echoed = [];
-    foreach (['one', 'two'] as $word) {
+    foreach (['one', 'two'] as $i => $word) {
         $call->startBatch([Grpc\OP_SEND_MESSAGE => ['message' => encode_payload($word)]]);
-        $r = $call->startBatch([Grpc\OP_RECV_MESSAGE => true]);
+        // Like grpc/grpc's BidiStreamingCall::read(), ask for initial metadata
+        // with the first read. ext-grpc 1.85 never completes a read on a call
+        // whose initial metadata was not requested.
+        $r = $call->startBatch([Grpc\OP_RECV_MESSAGE => true] + ($i === 0 ? [Grpc\OP_RECV_INITIAL_METADATA => true] : []));
         $echoed[] = decode_body($r->message);
     }
     $call->startBatch([Grpc\OP_SEND_CLOSE_FROM_CLIENT => true]);
@@ -232,7 +235,8 @@ $result['bidi_streaming'] = scenario('bidi_streaming', function () use ($channel
 
 // ---------------------------------------------------------------------------
 $result['deadline_expired'] = scenario('deadline_expired', function () use ($channel) {
-    // Deadline of 1µs after epoch: expired long before the call starts.
+    // new Timeval(1) is a 1µs timespan from now. C-core keeps deadlines in whole
+    // milliseconds, so a loopback call still completes.
     $call = new Grpc\Call($channel, '/grpc.testing.TestService/Echo', new Grpc\Timeval(1));
     $r = $call->startBatch([
         Grpc\OP_SEND_INITIAL_METADATA => [],
@@ -278,6 +282,41 @@ $result['cancel_mid_stream'] = scenario('cancel_mid_stream', function () use ($c
     $s = $call->startBatch([Grpc\OP_RECV_STATUS_ON_CLIENT => true]);
     return ['got_first_message' => $got_first, 'status_code' => $s->status->code];
 });
+
+// ---------------------------------------------------------------------------
+// Argument types: which calls are accepted, and the exception class, code and
+// message of those that are not — under strict_types and without it. The
+// cases live in parity_arg_cases.inc so both modes run the same source.
+function arg_type_probes(bool $strict): array {
+    $source = file_get_contents(__DIR__ . '/parity_arg_cases.inc');
+    return eval(($strict ? 'declare(strict_types=1);' : '') . $source);
+}
+$result['arg_types_strict'] = arg_type_probes(true);
+$result['arg_types_weak'] = arg_type_probes(false);
+// If eval ignored the declare, both modes would silently test the same thing.
+if ($result['arg_types_strict'] === $result['arg_types_weak']) {
+    fwrite(STDERR, "parity probe sentinel: strict and weak argument probes are identical\n");
+    exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// gRPC name syntax targets (issue #20).
+foreach (['dns:///localhost:50051', 'dns:localhost:50051', 'ipv4:127.0.0.1:50051'] as $target) {
+    $result['target ' . $target] = scenario('target ' . $target, function () use ($target) {
+        $ch = new Grpc\Channel($target, ['credentials' => Grpc\ChannelCredentials::createInsecure()]);
+        $call = new Grpc\Call($ch, '/grpc.testing.TestService/Echo',
+            Grpc\Timeval::now()->add(new Grpc\Timeval(5_000_000)));
+        $r = $call->startBatch([
+            Grpc\OP_SEND_INITIAL_METADATA => [],
+            Grpc\OP_SEND_MESSAGE => ['message' => encode_payload('hi')],
+            Grpc\OP_SEND_CLOSE_FROM_CLIENT => true,
+            Grpc\OP_RECV_INITIAL_METADATA => true,
+            Grpc\OP_RECV_MESSAGE => true,
+            Grpc\OP_RECV_STATUS_ON_CLIENT => true,
+        ]);
+        return ['status_code' => $r->status->code, 'target' => $ch->getTarget()];
+    });
+}
 
 // Sentinel: if the baseline scenario shows no working RPC, this probe run is
 // meaningless (dead server / dead port) and identical failure on both sides

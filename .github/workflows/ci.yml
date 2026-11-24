@@ -17,6 +17,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Configure Clang
+        run: |
+          LLVM_DIR=$(for d in $(ls -d /usr/lib/llvm-* 2>/dev/null | sort -V -r); do
+            if [ -x "$d/bin/clang" ] && ls "$d"/lib/libclang*.so* >/dev/null 2>&1; then
+              echo "$d"
+              break
+            fi
+          done)
+          if [ -n "$LLVM_DIR" ]; then
+            echo "LIBCLANG_PATH=$LLVM_DIR/lib" >> "$GITHUB_ENV"
+            echo "CLANG_PATH=$LLVM_DIR/bin/clang" >> "$GITHUB_ENV"
+          fi
       - name: cargo check
         run: cargo check
       - name: cargo clippy
@@ -26,14 +38,26 @@ jobs:
 
   docker-smoke:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.5', '8.6']
+    env:
+      PHP_VERSION: ${{ matrix.php }}
     steps:
       - uses: actions/checkout@v6
-      - name: Build and run core suites
+      - name: Build and run core suites (PHP ${{ matrix.php }})
         run: ./test.sh all
 
   zts-stress:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.5', '8.6']
+    env:
+      PHP_VERSION: ${{ matrix.php }}
     steps:
       - uses: actions/checkout@v6
-      - name: ZTS stress test (FrankenPHP, 200 concurrent gRPC+TLS requests)
+      - name: ZTS stress test (FrankenPHP PHP ${{ matrix.php }}, 200 concurrent gRPC+TLS requests)
         run: ./test.sh zts

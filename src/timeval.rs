@@ -20,15 +20,10 @@ impl GrpcTimeval {
     /// ext-grpc accepts ints and (weakly coerced) floats/numeric values here;
     /// callers commonly compute deadlines with float arithmetic.
     pub fn __construct(usec: &Zval) -> PhpResult<Self> {
-        let usec = if let Some(l) = usec.long() {
-            l
-        } else if let Some(d) = usec.double() {
-            d as i64
-        } else {
-            return Err(crate::error::invalid_argument(
-                "Timeval expects a numeric microseconds value",
-            ));
-        };
+        // ext-grpc parses a long first and falls back to a double.
+        let usec = crate::args::long(usec)
+            .or_else(|| crate::args::double(usec).map(|d| d as i64))
+            .ok_or_else(|| crate::error::invalid_argument("Timeval expects a long or double"))?;
         Ok(Self { usec, is_span: true })
     }
 
@@ -54,9 +49,9 @@ impl GrpcTimeval {
     pub fn now() -> PhpResult<Self> {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         let usec = i64::try_from(duration.as_micros())
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         Ok(Self {
             usec,
             is_span: false,
@@ -86,55 +81,74 @@ impl GrpcTimeval {
         }
     }
 
-    pub fn similar(a: &GrpcTimeval, b: &GrpcTimeval, threshold: &GrpcTimeval) -> bool {
+    pub fn similar(a: &Zval, b: &Zval, threshold: &Zval) -> PhpResult<bool> {
+        let a = a
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument("compare expects three Timevals"))?;
+        let b = b
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument("compare expects three Timevals"))?;
+        let threshold = threshold
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument("compare expects three Timevals"))?;
         let diff = (a.usec.saturating_sub(b.usec)).saturating_abs();
-        diff <= threshold.usec.saturating_abs()
+        Ok(diff <= threshold.usec.saturating_abs())
     }
 
-    pub fn compare(a: &GrpcTimeval, b: &GrpcTimeval) -> i64 {
-        match a.usec.cmp(&b.usec) {
+    pub fn compare(a: &Zval, b: &Zval) -> PhpResult<i64> {
+        let a = a
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument("compare expects two Timevals"))?;
+        let b = b
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument("compare expects two Timevals"))?;
+        Ok(match a.usec.cmp(&b.usec) {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1,
-        }
+        })
     }
 
-    pub fn add(&self, other: &GrpcTimeval) -> Self {
+    pub fn add(&self, other: &Zval) -> PhpResult<Self> {
+        let other = other
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument("add expects a Timeval"))?;
         // gpr time math saturates at infinities: inf ± finite == inf.
         if self.usec == i64::MAX || self.usec == i64::MIN {
-            return Self {
+            return Ok(Self {
                 usec: self.usec,
                 is_span: self.is_span,
-            };
+            });
         }
-        Self {
+        Ok(Self {
             usec: self.usec.saturating_add(other.usec),
-            // absolute + span = absolute; span + span = span
             is_span: self.is_span && other.is_span,
-        }
+        })
     }
 
-    pub fn subtract(&self, other: &GrpcTimeval) -> Self {
+    pub fn subtract(&self, other: &Zval) -> PhpResult<Self> {
+        let other = other
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument("subtract expects a Timeval"))?;
         if self.usec == i64::MAX || self.usec == i64::MIN {
-            return Self {
+            return Ok(Self {
                 usec: self.usec,
                 is_span: self.is_span,
-            };
+            });
         }
-        Self {
+        Ok(Self {
             usec: self.usec.saturating_sub(other.usec),
             is_span: self.is_span && other.is_span,
-        }
+        })
     }
 
-    /// Blocks until this (absolute) time has been reached.
     #[php(name = "sleepUntil")]
     pub fn sleep_until(&self) -> PhpResult<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         let now_usec = i64::try_from(now.as_micros())
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(|e| PhpException::from_message(e.to_string()))?;
         let remaining = self.usec.saturating_sub(now_usec);
         if remaining > 0 && self.usec != i64::MAX {
             let rt = crate::runtime::get_runtime().map_err(PhpException::from)?;

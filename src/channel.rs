@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ZendHashTable, Zval};
+use ext_php_rs::types::Zval;
 use parking_lot::Mutex;
 use tonic::transport::{Channel, Endpoint};
 
@@ -39,10 +39,59 @@ thread_local! {
 
 struct ChannelInner {
     shared: Arc<SharedChannel>,
+    /// The target exactly as PHP passed it (what getTarget() reports).
     target: String,
+    /// The "host:port" the target names, with any name-syntax scheme removed.
+    authority: String,
     call_plugin: Option<Arc<Mutex<Option<Zval>>>>,
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
+}
+
+/// C-core's default port for targets that name none.
+const DEFAULT_PORT: &str = "443";
+
+/// The "host:port" named by a target in gRPC name syntax
+/// (<https://github.com/grpc/grpc/blob/master/doc/naming.md>), or `None` when
+/// the target uses another form (bare "host:port", "http://…", "unix:…").
+///
+/// `dns:[//authority/]host[:port]`, `ipv4:addr[:port][,…]` and
+/// `ipv6:addr` / `ipv6:[addr]:port[,…]` are understood. The DNS authority
+/// (a specific DNS server) is ignored, and of an address list only the first
+/// entry is used — C-core would try the others in turn.
+fn name_syntax_authority(target: &str) -> Option<String> {
+    if let Some(rest) = target.strip_prefix("dns:") {
+        let host = match rest.strip_prefix("//") {
+            Some(after) => after.split_once('/').map_or(after, |(_dns_server, host)| host),
+            None => rest,
+        };
+        // A bracketed IPv6 literal ends with ']' when it carries no port.
+        let has_port = !host.ends_with(']') && host.contains(':');
+        return Some(if has_port {
+            host.to_string()
+        } else {
+            format!("{host}:{DEFAULT_PORT}")
+        });
+    }
+    if let Some(rest) = target.strip_prefix("ipv4:") {
+        let first = rest.split(',').next().unwrap_or(rest);
+        return Some(if first.contains(':') {
+            first.to_string()
+        } else {
+            format!("{first}:{DEFAULT_PORT}")
+        });
+    }
+    if let Some(rest) = target.strip_prefix("ipv6:") {
+        let first = rest.split(',').next().unwrap_or(rest);
+        return Some(if !first.starts_with('[') {
+            format!("[{first}]:{DEFAULT_PORT}")
+        } else if first.ends_with(']') {
+            format!("{first}:{DEFAULT_PORT}")
+        } else {
+            first.to_string()
+        });
+    }
+    None
 }
 
 #[php_class]
@@ -56,10 +105,13 @@ pub struct GrpcChannel {
 
 #[php_impl]
 impl GrpcChannel {
-    /// Constructs a new Channel.
-    ///
-    /// PHP signature: __construct(string $target, array $args)
-    pub fn __construct(target: String, args: &ZendHashTable) -> PhpResult<Self> {
+    pub fn __construct(target: &Zval, args: &Zval) -> PhpResult<Self> {
+        let msg = "Channel expects a string and an array";
+        let target =
+            crate::args::string(target).ok_or_else(|| crate::error::invalid_argument(msg))?;
+        let args = args
+            .array()
+            .ok_or_else(|| crate::error::invalid_argument(msg))?;
         let mut tls_config = None;
         let mut call_plugin = None;
         let mut creds_id: u64 = 0; // 0 = insecure
@@ -158,6 +210,7 @@ impl GrpcChannel {
                 return Ok(Self {
                     inner: Some(Arc::new(ChannelInner {
                         shared,
+                        authority: name_syntax_authority(&target).unwrap_or_else(|| target.clone()),
                         target,
                         call_plugin,
                         max_decoding_message_size,
@@ -168,15 +221,18 @@ impl GrpcChannel {
             }
         }
 
-        // The C gRPC extension accepts bare "host:port" targets, but tonic needs
-        // a URI with scheme. Use https:// for TLS credentials, http:// for insecure.
-        let uri_target = if target.contains("://") {
-            target.clone()
-        } else if tls_config.is_some() {
-            format!("https://{target}")
-        } else {
-            format!("http://{target}")
+        // ext-grpc takes gRPC name syntax ("dns:///host:port", "ipv4:1.2.3.4:5")
+        // and bare "host:port"; tonic needs a URI. Use https:// for TLS
+        // credentials, http:// for insecure.
+        let authority = name_syntax_authority(&target);
+        let uri_target = match &authority {
+            None if target.contains("://") => target.clone(),
+            _ => {
+                let scheme = if tls_config.is_some() { "https" } else { "http" };
+                format!("{scheme}://{}", authority.as_deref().unwrap_or(&target))
+            }
         };
+        let authority = authority.unwrap_or_else(|| target.clone());
 
         let mut endpoint = Endpoint::from_shared(uri_target)
             .map_err(|e| PhpException::from(GrpcError::InvalidUri(e.to_string())))?;
@@ -278,6 +334,7 @@ impl GrpcChannel {
         Ok(Self {
             inner: Some(Arc::new(ChannelInner {
                 shared,
+                authority,
                 target,
                 call_plugin,
                 max_decoding_message_size,
@@ -299,14 +356,12 @@ impl GrpcChannel {
     /// Returns the connectivity state.
     #[php(name = "getConnectivityState")]
     pub fn get_connectivity_state(&self, try_to_connect: Option<&Zval>) -> PhpResult<i64> {
-        // ext-grpc rejects non-bool arguments instead of coercing.
-        if let Some(zv) = try_to_connect
-            && zv.bool().is_none()
-        {
-            return Err(crate::error::invalid_argument(
-                "getConnectivityState expects a bool",
-            ));
-        }
+        let connect = match try_to_connect {
+            None => false,
+            Some(zv) => crate::args::boolean(zv).ok_or_else(|| {
+                crate::error::invalid_argument("getConnectivityState expects a bool")
+            })?,
+        };
         let inner = self.inner.as_ref().ok_or_else(|| {
             crate::error::runtime_exception(
                 "getConnectivityState error.Channel is already closed.",
@@ -320,7 +375,6 @@ impl GrpcChannel {
         // try_to_connect=true on an idle channel kicks off a real connection
         // attempt; the state transitions IDLE→CONNECTING→READY/TRANSIENT_FAILURE
         // asynchronously, like C-core.
-        let connect = try_to_connect.and_then(Zval::bool).unwrap_or(false);
         if connect && current == CHANNEL_IDLE {
             let shared = Arc::clone(&inner.shared);
             let rt = crate::runtime::get_runtime().map_err(PhpException::from)?;
@@ -338,15 +392,18 @@ impl GrpcChannel {
         Ok(current)
     }
 
-    /// Watches for a connectivity state change.
-    ///
-    /// Returns true if state changed before deadline, false on timeout.
     #[php(name = "watchConnectivityState")]
     pub fn watch_connectivity_state(
         &self,
-        last_state: i64,
-        deadline: &GrpcTimeval,
+        last_state: &Zval,
+        deadline: &Zval,
     ) -> PhpResult<bool> {
+        let msg = "watchConnectivityState expects 1 long 1 timeval";
+        let last_state =
+            crate::args::long(last_state).ok_or_else(|| crate::error::invalid_argument(msg))?;
+        let deadline = deadline
+            .extract::<&GrpcTimeval>()
+            .ok_or_else(|| crate::error::invalid_argument(msg))?;
         let inner = self.inner.as_ref().ok_or_else(|| {
             crate::error::runtime_exception("watchConnectivityState errorChannel is already closed.")
         })?;
@@ -390,9 +447,9 @@ impl GrpcChannel {
         self.inner.as_ref().map(|i| Arc::clone(&i.shared))
     }
 
-    /// Returns the target URI string.
-    pub(crate) fn get_target_uri(&self) -> Option<String> {
-        self.inner.as_ref().map(|i| i.target.clone())
+    /// Returns the "host:port" this channel connects to.
+    pub(crate) fn get_authority(&self) -> Option<String> {
+        self.inner.as_ref().map(|i| i.authority.clone())
     }
 
     /// Shared closed-state flag, observed by calls created from this channel.
@@ -415,5 +472,40 @@ impl GrpcChannel {
     /// Returns the configured max encoding (send) message size, if any.
     pub(crate) fn get_max_encoding_message_size(&self) -> Option<usize> {
         self.inner.as_ref().and_then(|i| i.max_encoding_message_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_syntax_authority;
+
+    #[test]
+    fn dns_targets() {
+        for target in ["dns:///localhost:50051", "dns:localhost:50051", "dns://8.8.8.8/localhost:50051"] {
+            assert_eq!(name_syntax_authority(target).as_deref(), Some("localhost:50051"), "{target}");
+        }
+        assert_eq!(name_syntax_authority("dns:///example.com").as_deref(), Some("example.com:443"));
+        assert_eq!(name_syntax_authority("dns:///[::1]:50051").as_deref(), Some("[::1]:50051"));
+        assert_eq!(name_syntax_authority("dns:///[::1]").as_deref(), Some("[::1]:443"));
+    }
+
+    #[test]
+    fn ip_targets() {
+        assert_eq!(name_syntax_authority("ipv4:127.0.0.1:50051").as_deref(), Some("127.0.0.1:50051"));
+        assert_eq!(name_syntax_authority("ipv4:127.0.0.1").as_deref(), Some("127.0.0.1:443"));
+        assert_eq!(
+            name_syntax_authority("ipv4:10.0.0.1:1,10.0.0.2:2").as_deref(),
+            Some("10.0.0.1:1")
+        );
+        assert_eq!(name_syntax_authority("ipv6:[::1]:50051").as_deref(), Some("[::1]:50051"));
+        assert_eq!(name_syntax_authority("ipv6:[::1]").as_deref(), Some("[::1]:443"));
+        assert_eq!(name_syntax_authority("ipv6:::1").as_deref(), Some("[::1]:443"));
+    }
+
+    #[test]
+    fn other_targets_are_left_alone() {
+        for target in ["localhost:50051", "http://localhost:50051", "https://example.com", "unix:///tmp/sock"] {
+            assert_eq!(name_syntax_authority(target), None, "{target}");
+        }
     }
 }

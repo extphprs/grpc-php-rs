@@ -16,6 +16,7 @@
     clippy::print_stderr
 )]
 
+mod args;
 mod call;
 mod channel;
 mod codec;
@@ -24,7 +25,9 @@ mod error;
 mod runtime;
 mod timeval;
 
+use ext_php_rs::flags::IniEntryPermission;
 use ext_php_rs::prelude::*;
+use ext_php_rs::zend::{IniEntryDef, IniEntryDefs};
 
 // Re-export PHP classes so ext-php-rs can register them.
 pub use call::GrpcCall;
@@ -48,33 +51,24 @@ mod compat;
 // reject us. Bump when ext-grpc publishes a new stable.
 // Our own crate version lives in Cargo.toml + git tags and is unrelated.
 // ---------------------------------------------------------------------------
-const EXT_GRPC_COMPAT_VERSION: &str = "1.83.0";
+const EXT_GRPC_COMPAT_VERSION: &str = "1.85.4";
 
 // ---------------------------------------------------------------------------
 // Constants — registered via module startup
 // ---------------------------------------------------------------------------
 
+static INI_ENTRIES: IniEntryDefs<5> = IniEntryDefs::new([
+    IniEntryDef::new(c"grpc.enable_fork_support", c"0", IniEntryPermission::System),
+    IniEntryDef::new(c"grpc.poll_strategy", c"", IniEntryPermission::System),
+    IniEntryDef::new(c"grpc.grpc_verbosity", c"", IniEntryPermission::System),
+    IniEntryDef::new(c"grpc.grpc_trace", c"", IniEntryPermission::System),
+    IniEntryDef::end(),
+]);
+
 fn register_constants(_ty: i32, mod_num: i32) -> i32 {
     use ext_php_rs::constant::IntoConst;
-    use ext_php_rs::flags::IniEntryPermission;
-    use ext_php_rs::zend::IniEntryDef;
 
-    // ini entries ext-grpc registers; deployment tooling probes for these
-    // via ini_get(). They are accepted but have no effect in this
-    // implementation (no C-core fork handling / pollers to configure).
-    IniEntryDef::register(
-        vec![
-            IniEntryDef::new(
-                "grpc.enable_fork_support".into(),
-                "0".into(),
-                &IniEntryPermission::System,
-            ),
-            IniEntryDef::new("grpc.poll_strategy".into(), String::new(), &IniEntryPermission::System),
-            IniEntryDef::new("grpc.grpc_verbosity".into(), String::new(), &IniEntryPermission::System),
-            IniEntryDef::new("grpc.grpc_trace".into(), String::new(), &IniEntryPermission::System),
-        ],
-        mod_num,
-    );
+    IniEntryDef::register(INI_ENTRIES.as_slice(), mod_num);
 
     macro_rules! reg {
         ($name:expr, $val:expr, $mod:expr) => {
