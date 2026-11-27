@@ -252,6 +252,13 @@ impl GrpcChannel {
             endpoint = endpoint.keep_alive_timeout(Duration::from_millis(ms as u64));
         }
 
+        if let Some(enabled) = args
+            .get("grpc.keepalive_permit_without_calls")
+            .and_then(|val| val.long())
+        {
+            endpoint = endpoint.keep_alive_while_idle(enabled != 0);
+        }
+
         // Extract SSL target name override
         if let Some(val) = args.get("grpc.ssl_target_name_override")
             && let Some(name) = val.string()
